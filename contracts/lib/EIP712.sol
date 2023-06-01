@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.13;
+pragma solidity 0.8.17;
 
 import {Order, Fee} from "./OrderStructs.sol";
 
@@ -151,4 +151,6 @@ contract EIP712 {
             ))
         ));
     }
+
+    uint256[44] private __gap;
 }

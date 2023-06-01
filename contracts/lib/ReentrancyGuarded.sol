@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.13;
+pragma solidity 0.8.17;
 
 /**
  * @title ReentrancyGuarded
@@ -7,7 +7,7 @@ pragma solidity 0.8.13;
  */
 contract ReentrancyGuarded {
 
-    bool reentrancyLock = false;
+    bool private reentrancyLock = false;
 
     /* Prevent a contract function from being reentrant-called. */
     modifier reentrancyGuard {
@@ -17,4 +17,5 @@ contract ReentrancyGuarded {
         reentrancyLock = false;
     }
 
+    uint256[49] private __gap;
 }

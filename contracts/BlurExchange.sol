@@ -1,16 +1,15 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.13;
-pragma abicoder v2;
+pragma solidity 0.8.17;
 
 import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
-import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
 import "./lib/ReentrancyGuarded.sol";
 import "./lib/EIP712.sol";
 import "./lib/MerkleVerifier.sol";
 import "./interfaces/IBlurExchange.sol";
+import "./interfaces/IBlurPool.sol";
 import "./interfaces/IExecutionDelegate.sol";
 import "./interfaces/IPolicyManager.sol";
 import "./interfaces/IMatchingPolicy.sol";
@@ -20,7 +19,8 @@ import {
   AssetType,
   Fee,
   Order,
-  Input
+  Input,
+  Execution
 } from "./lib/OrderStructs.sol";
 
 /**
@@ -34,6 +34,20 @@ contract BlurExchange is IBlurExchange, ReentrancyGuarded, EIP712, OwnableUpgrad
 
     modifier whenOpen() {
         require(isOpen == 1, "Closed");
+        _;
+    }
+
+    modifier setupExecution() {
+        require(!isInternal, "Unsafe call"); // add redundant re-entrancy check for clarity
+        remainingETH = msg.value;
+        isInternal = true;
+        _;
+        remainingETH = 0;
+        isInternal = false;
+    }
+
+    modifier internalCall() {
+        require(isInternal, "Unsafe call");
         _;
     }
 
@@ -54,22 +68,33 @@ contract BlurExchange is IBlurExchange, ReentrancyGuarded, EIP712, OwnableUpgrad
 
 
     /* Constants */
-    string public constant name = "Blur Exchange";
-    string public constant version = "1.0";
-    uint256 public constant INVERSE_BASIS_POINT = 10000;
+    string public constant NAME = "Blur Exchange";
+    string public constant VERSION = "1.0";
+    uint256 public constant INVERSE_BASIS_POINT = 10_000;
+    address public constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address public constant POOL = 0x0000000000A39bb272e79075ade125fd351887Ac;
+    uint256 private constant MAX_FEE_RATE = 250;
 
 
     /* Variables */
-    address public weth;
     IExecutionDelegate public executionDelegate;
     IPolicyManager public policyManager;
     address public oracle;
     uint256 public blockRange;
 
-
     /* Storage */
     mapping(bytes32 => bool) public cancelledOrFilled;
     mapping(address => uint256) public nonces;
+
+    bool public isInternal = false;
+    uint256 public remainingETH = 0;
+
+
+    /* Governance Variables */
+    uint256 public feeRate;
+    address public feeRecipient;
+
+    address public governor;
 
 
     /* Events */
@@ -83,53 +108,121 @@ contract BlurExchange is IBlurExchange, ReentrancyGuarded, EIP712, OwnableUpgrad
     );
 
     event OrderCancelled(bytes32 hash);
-    event NonceIncremented(address trader, uint256 newNonce);
+    event NonceIncremented(address indexed trader, uint256 newNonce);
 
-    event NewExecutionDelegate(IExecutionDelegate executionDelegate);
-    event NewPolicyManager(IPolicyManager policyManager);
-    event NewOracle(address oracle);
+    event NewExecutionDelegate(IExecutionDelegate indexed executionDelegate);
+    event NewPolicyManager(IPolicyManager indexed policyManager);
+    event NewOracle(address indexed oracle);
     event NewBlockRange(uint256 blockRange);
+    event NewFeeRate(uint256 feeRate);
+    event NewFeeRecipient(address feeRecipient);
+    event NewGovernor(address governor);
 
+    constructor() {
+      _disableInitializers();
+    }
 
     /* Constructor (for ERC1967) */
     function initialize(
-        uint chainId,
-        address _weth,
         IExecutionDelegate _executionDelegate,
         IPolicyManager _policyManager,
         address _oracle,
         uint _blockRange
-    ) public initializer {
+    ) external initializer {
         __Ownable_init();
         isOpen = 1;
 
         DOMAIN_SEPARATOR = _hashDomain(EIP712Domain({
-            name              : name,
-            version           : version,
-            chainId           : chainId,
+            name              : NAME,
+            version           : VERSION,
+            chainId           : block.chainid,
             verifyingContract : address(this)
         }));
 
-        weth = _weth;
         executionDelegate = _executionDelegate;
         policyManager = _policyManager;
         oracle = _oracle;
         blockRange = _blockRange;
     }
 
-
     /* External Functions */
-
     /**
-     * @dev Match two orders, ensuring validity of the match, and execute all associated state transitions. Protected against reentrancy by a contract-global lock.
+     * @dev _execute wrapper
      * @param sell Sell input
      * @param buy Buy input
      */
     function execute(Input calldata sell, Input calldata buy)
         external
         payable
-        reentrancyGuard
         whenOpen
+        setupExecution
+    {
+        _execute(sell, buy);
+        _returnDust();
+    }
+
+    /**
+     * @dev Bulk execute multiple matches
+     * @param executions Potential buy/sell matches
+     */
+    function bulkExecute(Execution[] calldata executions)
+        external
+        payable
+        whenOpen
+        setupExecution
+    {
+        /*
+        REFERENCE
+        uint256 executionsLength = executions.length;
+        for (uint8 i=0; i < executionsLength; i++) {
+            bytes memory data = abi.encodeWithSelector(this._execute.selector, executions[i].sell, executions[i].buy);
+            (bool success,) = address(this).delegatecall(data);
+        }
+        _returnDust(remainingETH);
+        */
+        uint256 executionsLength = executions.length;
+
+        if (executionsLength == 0) {
+          revert("No orders to execute");
+        }
+        for (uint8 i = 0; i < executionsLength; i++) {
+            assembly {
+                let memPointer := mload(0x40)
+
+                let order_location := calldataload(add(executions.offset, mul(i, 0x20)))
+                let order_pointer := add(executions.offset, order_location)
+
+                let size
+                switch eq(add(i, 0x01), executionsLength)
+                case 1 {
+                    size := sub(calldatasize(), order_pointer)
+                }
+                default {
+                    let next_order_location := calldataload(add(executions.offset, mul(add(i, 0x01), 0x20)))
+                    let next_order_pointer := add(executions.offset, next_order_location)
+                    size := sub(next_order_pointer, order_pointer)
+                }
+
+                mstore(memPointer, 0xe04d94ae00000000000000000000000000000000000000000000000000000000) // _execute
+                calldatacopy(add(0x04, memPointer), order_pointer, size)
+                // must be put in separate transaction to bypass failed executions
+                // must be put in delegatecall to maintain the authorization from the caller
+                let result := delegatecall(gas(), address(), memPointer, add(size, 0x04), 0, 0)
+            }
+        }
+        _returnDust();
+    }
+
+    /**
+     * @dev Match two orders, ensuring validity of the match, and execute all associated state transitions. Must be called internally.
+     * @param sell Sell input
+     * @param buy Buy input
+     */
+    function _execute(Input calldata sell, Input calldata buy)
+        public
+        payable
+        internalCall
+        reentrancyGuard // move re-entrancy check for clarity
     {
         require(sell.order.side == Side.Sell);
 
@@ -144,11 +237,16 @@ contract BlurExchange is IBlurExchange, ReentrancyGuarded, EIP712, OwnableUpgrad
 
         (uint256 price, uint256 tokenId, uint256 amount, AssetType assetType) = _canMatchOrders(sell.order, buy.order);
 
+        /* Mark orders as filled. */
+        cancelledOrFilled[sellHash] = true;
+        cancelledOrFilled[buyHash] = true;
+
         _executeFundsTransfer(
             sell.order.trader,
             buy.order.trader,
             sell.order.paymentToken,
             sell.order.fees,
+            buy.order.fees,
             price
         );
         _executeTokenTransfer(
@@ -159,10 +257,6 @@ contract BlurExchange is IBlurExchange, ReentrancyGuarded, EIP712, OwnableUpgrad
             amount,
             assetType
         );
-
-        /* Mark orders as filled. */
-        cancelledOrFilled[sellHash] = true;
-        cancelledOrFilled[buyHash] = true;
 
         emit OrdersMatched(
             sell.order.listingTime <= buy.order.listingTime ? sell.order.trader : buy.order.trader,
@@ -180,15 +274,15 @@ contract BlurExchange is IBlurExchange, ReentrancyGuarded, EIP712, OwnableUpgrad
      */
     function cancelOrder(Order calldata order) public {
         /* Assert sender is authorized to cancel order. */
-        require(msg.sender == order.trader);
+        require(msg.sender == order.trader, "Not sent by trader");
 
         bytes32 hash = _hashOrder(order, nonces[order.trader]);
 
-        if (!cancelledOrFilled[hash]) {
-            /* Mark order as cancelled, preventing it from being matched. */
-            cancelledOrFilled[hash] = true;
-            emit OrderCancelled(hash);
-        }
+        require(!cancelledOrFilled[hash], "Order cancelled or filled");
+
+        /* Mark order as cancelled, preventing it from being matched. */
+        cancelledOrFilled[hash] = true;
+        emit OrderCancelled(hash);
     }
 
     /**
@@ -247,6 +341,31 @@ contract BlurExchange is IBlurExchange, ReentrancyGuarded, EIP712, OwnableUpgrad
         emit NewBlockRange(blockRange);
     }
 
+    function setGovernor(address _governor)
+        external
+        onlyOwner
+    {
+        governor = _governor;
+        emit NewGovernor(governor);
+    }
+
+    function setFeeRate(uint256 _feeRate)
+        external
+    {
+        require(msg.sender == governor, "Fee rate can only be set by governor");
+        require(_feeRate <= MAX_FEE_RATE, "Fee cannot be more than 2.5%");
+        feeRate = _feeRate;
+        emit NewFeeRate(feeRate);
+    }
+
+    function setFeeRecipient(address _feeRecipient)
+        external
+        onlyOwner
+    {
+        feeRecipient = _feeRecipient;
+        emit NewFeeRecipient(feeRecipient);
+    }
+
 
     /* Internal Functions */
 
@@ -264,23 +383,11 @@ contract BlurExchange is IBlurExchange, ReentrancyGuarded, EIP712, OwnableUpgrad
             /* Order must have a trader. */
             (order.trader != address(0)) &&
             /* Order must not be cancelled or filled. */
-            (cancelledOrFilled[orderHash] == false) &&
+            (!cancelledOrFilled[orderHash]) &&
             /* Order must be settleable. */
-            _canSettleOrder(order.listingTime, order.expirationTime)
+            (order.listingTime < block.timestamp) &&
+            (block.timestamp < order.expirationTime)
         );
-    }
-
-    /**
-     * @dev Check if the order can be settled at the current timestamp
-     * @param listingTime order listing time
-     * @param expirationTime order expiration time
-     */
-    function _canSettleOrder(uint256 listingTime, uint256 expirationTime)
-        view
-        internal
-        returns (bool)
-    {
-        return (listingTime < block.timestamp) && (expirationTime == 0 || block.timestamp < expirationTime);
     }
 
     /**
@@ -293,6 +400,21 @@ contract BlurExchange is IBlurExchange, ReentrancyGuarded, EIP712, OwnableUpgrad
         view
         returns (bool)
     {
+
+        if (order.order.extraParams.length > 0 && order.order.extraParams[0] == 0x01) {
+            /* Check oracle authorization. */
+            require(block.number - order.blockNumber < blockRange, "Signed block number out of range");
+            if (
+                !_validateOracleAuthorization(
+                    orderHash,
+                    order.signatureVersion,
+                    order.extraSignature,
+                    order.blockNumber
+                )
+            ) {
+                return false;
+            }
+        }
 
         if (order.order.trader == msg.sender) {
           return true;
@@ -311,21 +433,6 @@ contract BlurExchange is IBlurExchange, ReentrancyGuarded, EIP712, OwnableUpgrad
             )
         ) {
             return false;
-        }
-
-        if (order.order.expirationTime == 0) {
-            /* Check oracle authorization. */
-            require(block.number - order.blockNumber < blockRange, "Signed block number out of range");
-            if (
-                !_validateOracleAuthorization(
-                    orderHash,
-                    order.signatureVersion,
-                    order.extraSignature,
-                    order.blockNumber
-                )
-            ) {
-                return false;
-            }
         }
 
         return true;
@@ -362,7 +469,7 @@ contract BlurExchange is IBlurExchange, ReentrancyGuarded, EIP712, OwnableUpgrad
             hashToSign = _hashToSignRoot(computedRoot);
         }
 
-        return _recover(hashToSign, v, r, s) == trader;
+        return _verify(trader, hashToSign, v, r, s);
     }
 
     /**
@@ -382,30 +489,55 @@ contract BlurExchange is IBlurExchange, ReentrancyGuarded, EIP712, OwnableUpgrad
 
         uint8 v; bytes32 r; bytes32 s;
         if (signatureVersion == SignatureVersion.Single) {
+            assembly {
+                v := calldataload(extraSignature.offset)
+                r := calldataload(add(extraSignature.offset, 0x20))
+                s := calldataload(add(extraSignature.offset, 0x40))
+            }
+            /*
+            REFERENCE
             (v, r, s) = abi.decode(extraSignature, (uint8, bytes32, bytes32));
+            */
         } else if (signatureVersion == SignatureVersion.Bulk) {
-            /* If the signature was a bulk listing the merkle path musted be unpacked before the oracle signature. */
+            /* If the signature was a bulk listing the merkle path must be unpacked before the oracle signature. */
+            assembly {
+                v := calldataload(add(extraSignature.offset, 0x20))
+                r := calldataload(add(extraSignature.offset, 0x40))
+                s := calldataload(add(extraSignature.offset, 0x60))
+            }
+            /*
+            REFERENCE
+            uint8 _v, bytes32 _r, bytes32 _s;
             (bytes32[] memory merklePath, uint8 _v, bytes32 _r, bytes32 _s) = abi.decode(extraSignature, (bytes32[], uint8, bytes32, bytes32));
             v = _v; r = _r; s = _s;
+            */
         }
 
-        return _recover(oracleHash, v, r, s) == oracle;
+        return _verify(oracle, oracleHash, v, r, s);
     }
 
     /**
-     * @dev Wrapped ecrecover with safety check for v parameter
+     * @dev Verify ECDSA signature
+     * @param signer Expected signer
+     * @param digest Signature preimage
      * @param v v
      * @param r r
      * @param s s
      */
-    function _recover(
+    function _verify(
+        address signer,
         bytes32 digest,
         uint8 v,
         bytes32 r,
         bytes32 s
-    ) internal pure returns (address) {
+    ) internal pure returns (bool) {
         require(v == 27 || v == 28, "Invalid v parameter");
-        return ecrecover(digest, v, r, s);
+        address recoveredSigner = ecrecover(digest, v, r, s);
+        if (recoveredSigner == address(0)) {
+          return false;
+        } else {
+          return signer == recoveredSigner;
+        }
     }
 
     /**
@@ -438,25 +570,34 @@ contract BlurExchange is IBlurExchange, ReentrancyGuarded, EIP712, OwnableUpgrad
      * @param seller seller
      * @param buyer buyer
      * @param paymentToken payment token
-     * @param fees fees
+     * @param sellerFees seller fees
+     * @param buyerFees buyer fees
      * @param price price
      */
     function _executeFundsTransfer(
         address seller,
         address buyer,
         address paymentToken,
-        Fee[] calldata fees,
+        Fee[] calldata sellerFees,
+        Fee[] calldata buyerFees,
         uint256 price
     ) internal {
         if (paymentToken == address(0)) {
-            require(msg.value == price);
+            require(msg.sender == buyer, "Cannot use ETH");
+            require(remainingETH >= price, "Insufficient value");
+            remainingETH -= price;
         }
 
         /* Take fee. */
-        uint256 receiveAmount = _transferFees(fees, paymentToken, buyer, price);
+        uint256 sellerFeesPaid = _transferFees(sellerFees, paymentToken, buyer, price, true);
+        uint256 buyerFeesPaid = _transferFees(buyerFees, paymentToken, buyer, price, false);
+        if (paymentToken == address(0)) {
+          /* Need to account for buyer fees paid on top of the price. */
+          remainingETH -= buyerFeesPaid;
+        }
 
         /* Transfer remainder to seller. */
-        _transferTo(paymentToken, buyer, seller, receiveAmount);
+        _transferTo(paymentToken, buyer, seller, price - sellerFeesPaid);
     }
 
     /**
@@ -465,25 +606,34 @@ contract BlurExchange is IBlurExchange, ReentrancyGuarded, EIP712, OwnableUpgrad
      * @param paymentToken address of token to pay in
      * @param from address to charge fees
      * @param price price of token
+     * @return total fees paid
      */
     function _transferFees(
         Fee[] calldata fees,
         address paymentToken,
         address from,
-        uint256 price
+        uint256 price,
+        bool protocolFee
     ) internal returns (uint256) {
         uint256 totalFee = 0;
+
+        /* Take protocol fee if enabled. */
+        if (feeRate > 0 && protocolFee) {
+            uint256 fee = (price * feeRate) / INVERSE_BASIS_POINT;
+            _transferTo(paymentToken, from, feeRecipient, fee);
+            totalFee += fee;
+        }
+
+        /* Take order fees. */
         for (uint8 i = 0; i < fees.length; i++) {
             uint256 fee = (price * fees[i].rate) / INVERSE_BASIS_POINT;
             _transferTo(paymentToken, from, fees[i].recipient, fee);
             totalFee += fee;
         }
 
-        require(totalFee <= price, "Total amount of fees are more than the price");
+        require(totalFee <= price, "Fees are more than the price");
 
-        /* Amount that will be received by seller. */
-        uint256 receiveAmount = price - totalFee;
-        return (receiveAmount);
+        return totalFee;
     }
 
     /**
@@ -505,10 +655,16 @@ contract BlurExchange is IBlurExchange, ReentrancyGuarded, EIP712, OwnableUpgrad
 
         if (paymentToken == address(0)) {
             /* Transfer funds in ETH. */
-            payable(to).transfer(amount);
-        } else if (paymentToken == weth) {
+            require(to != address(0), "Transfer to zero address");
+            (bool success,) = payable(to).call{value: amount}("");
+            require(success, "ETH transfer failed");
+        } else if (paymentToken == POOL) {
+            /* Transfer Pool funds. */
+            bool success = IBlurPool(POOL).transferFrom(from, to, amount);
+            require(success, "Pool transfer failed");
+        } else if (paymentToken == WETH) {
             /* Transfer funds in WETH. */
-            executionDelegate.transferERC20(weth, from, to, amount);
+            executionDelegate.transferERC20(WETH, from, to, amount);
         } else {
             revert("Invalid payment token");
         }
@@ -530,9 +686,6 @@ contract BlurExchange is IBlurExchange, ReentrancyGuarded, EIP712, OwnableUpgrad
         uint256 amount,
         AssetType assetType
     ) internal {
-        /* Assert collection exists. */
-        require(_exists(collection), "Collection does not exist");
-
         /* Call execution delegate. */
         if (assetType == AssetType.ERC721) {
             executionDelegate.transferERC721(collection, from, to, tokenId);
@@ -542,18 +695,25 @@ contract BlurExchange is IBlurExchange, ReentrancyGuarded, EIP712, OwnableUpgrad
     }
 
     /**
-     * @dev Determine if the given address exists
-     * @param what address to check
+     * @dev Return remaining ETH sent to bulkExecute or execute
      */
-    function _exists(address what)
-        internal
-        view
-        returns (bool)
-    {
-        uint size;
+    function _returnDust() private {
+        uint256 _remainingETH = remainingETH;
         assembly {
-            size := extcodesize(what)
+            if gt(_remainingETH, 0) {
+                let callStatus := call(
+                    gas(),
+                    caller(),
+                    _remainingETH,
+                    0,
+                    0,
+                    0,
+                    0
+                )
+                if iszero(callStatus) {
+                  revert(0, 0)
+                }
+            }
         }
-        return size > 0;
     }
 }

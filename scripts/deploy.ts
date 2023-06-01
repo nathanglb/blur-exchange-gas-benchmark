@@ -32,17 +32,29 @@ export async function deployFull(
     { libraries: { MerkleVerifier: merkleVerifier.address } },
     'BlurExchangeImpl',
   );
+  //const initializeInterface = new hre.ethers.utils.Interface([
+  //  'function initialize(uint256, address, address, address, address, uint256)',
+  //]);
   const initializeInterface = new hre.ethers.utils.Interface([
-    'function initialize(uint256, address, address, address, address, uint256)',
+    'function initialize(address, address, address, uint256)',
   ]);
+
+  //const initialize = initializeInterface.encodeFunctionData('initialize', [
+  //  chainId, // chainId
+  //  WETH_ADDRESS, // _weth
+  //  executionDelegate.address, // _executionDelegate
+  //  policyManager.address, // _policyManager
+  //  oracleAddress, // _oracle
+  //  5, // _blockRange
+  //]);
+
   const initialize = initializeInterface.encodeFunctionData('initialize', [
-    chainId, // chainId
-    WETH_ADDRESS, // _weth
     executionDelegate.address, // _executionDelegate
     policyManager.address, // _policyManager
     oracleAddress, // _oracle
     5, // _blockRange
   ]);
+
   const exchangeProxy = await deploy(
     hre,
     'ERC1967Proxy',
@@ -50,6 +62,7 @@ export async function deployFull(
     {},
     'BlurExchange',
   );
+
   await waitForTx(executionDelegate.approveContract(exchangeProxy.address));
 
   const exchange = new hre.ethers.Contract(

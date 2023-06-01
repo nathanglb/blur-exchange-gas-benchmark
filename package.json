@@ -62,6 +62,7 @@
     "@nomiclabs/hardhat-web3": "^2.0.0",
     "@openzeppelin/contracts": "4.4.1",
     "@openzeppelin/contracts-upgradeable": "^4.6.0",
+    "@rari-capital/solmate": "^6.4.0",
     "@types/chai-almost": "^1.0.1",
     "@types/yargs": "^17.0.7",
     "bigint-fraction": "^1.0.4",

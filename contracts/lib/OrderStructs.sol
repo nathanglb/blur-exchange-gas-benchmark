@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.13;
+pragma solidity 0.8.17;
 
 enum Side { Buy, Sell }
 enum SignatureVersion { Single, Bulk }
@@ -35,4 +35,9 @@ struct Input {
     bytes extraSignature;
     SignatureVersion signatureVersion;
     uint256 blockNumber;
+}
+
+struct Execution {
+  Input sell;
+  Input buy;
 }

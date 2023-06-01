@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.13;
-pragma abicoder v2;
+pragma solidity 0.8.17;
 
 import {Input, Order} from "../lib/OrderStructs.sol";
 import "./IExecutionDelegate.sol";
@@ -12,8 +11,6 @@ interface IBlurExchange {
     function close() external;
 
     function initialize(
-        uint chainId,
-        address _weth,
         IExecutionDelegate _executionDelegate,
         IPolicyManager _policyManager,
         address _oracle,

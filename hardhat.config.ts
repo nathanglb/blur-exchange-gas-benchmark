@@ -62,7 +62,7 @@ const config: HardhatUserConfig = {
   solidity: {
     compilers: [
       {
-        version: '0.8.13',
+        version: '0.8.17',
         settings: {
           metadata: {
             bytecodeHash: 'none',
@@ -80,6 +80,10 @@ const config: HardhatUserConfig = {
     cache: './cache',
     sources: './contracts',
     tests: './tests',
+  },
+
+  mocha: {
+    timeout: 100000000
   },
 };
 

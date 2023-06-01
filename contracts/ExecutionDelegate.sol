@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.13;
-pragma abicoder v2;
+pragma solidity 0.8.17;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/Address.sol";
 
 import {IExecutionDelegate} from "./interfaces/IExecutionDelegate.sol";
 
@@ -14,6 +14,8 @@ import {IExecutionDelegate} from "./interfaces/IExecutionDelegate.sol";
  * @dev Proxy contract to manage user token approvals
  */
 contract ExecutionDelegate is IExecutionDelegate, Ownable {
+
+    using Address for address;
 
     mapping(address => bool) public contracts;
     mapping(address => bool) public revokedApproval;
@@ -119,9 +121,12 @@ contract ExecutionDelegate is IExecutionDelegate, Ownable {
     function transferERC20(address token, address from, address to, uint256 amount)
         approvedContract
         external
-        returns (bool)
     {
         require(revokedApproval[from] == false, "User has revoked approval");
-        return IERC20(token).transferFrom(from, to, amount);
+        bytes memory data = abi.encodeWithSelector(IERC20.transferFrom.selector, from, to, amount);
+        bytes memory returndata = token.functionCall(data);
+        if (returndata.length > 0) {
+          require(abi.decode(returndata, (bool)), "ERC20 transfer failed");
+        }
     }
 }

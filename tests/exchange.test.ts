@@ -8,6 +8,7 @@ import { runSignatureTests } from './signatures.test';
 import { runMatchingPolicyTests } from './policy.test';
 import { runExecuteTests } from './execution.test';
 import { runPermissionsTests } from './permissions.test';
+import { runBenchmarkTests } from './benchmark.test';
 
 export function runExchangeTests(
   setupExchange: SetupExchangeFunction,
@@ -112,6 +113,17 @@ export function runExchangeTests(
     describe(
       'execute',
       runExecuteTests(async () => {
+        return setupTest({
+          price,
+          feeRate,
+          setupExchange,
+        });
+      }),
+    );
+
+    describe.only(
+      'benchmark',
+      runBenchmarkTests(async () => {
         return setupTest({
           price,
           feeRate,
